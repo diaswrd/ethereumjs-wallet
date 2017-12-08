@@ -1,6 +1,6 @@
 var ethUtil = require('ethereumjs-util')
 var crypto = require('crypto')
-var scryptsy = require('scrypt.js')
+var scryptsy = require('scrypt-js')
 var uuid = require('uuid')
 var bs58check = require('bs58check')
 
@@ -60,21 +60,6 @@ Wallet.generate = function (icapDirect) {
   }
 }
 
-Wallet.generateVanityAddress = function (pattern) {
-  if (typeof pattern !== 'object') {
-    pattern = new RegExp(pattern)
-  }
-
-  while (true) {
-    var privKey = crypto.randomBytes(32)
-    var address = ethUtil.privateToAddress(privKey)
-
-    if (pattern.test(address.toString('hex'))) {
-      return new Wallet(privKey)
-    }
-  }
-}
-
 Wallet.prototype.getPrivateKey = function () {
   return this.privKey
 }
@@ -104,7 +89,7 @@ Wallet.prototype.getChecksumAddressString = function () {
 }
 
 // https://github.com/ethereum/wiki/wiki/Web3-Secret-Storage-Definition
-Wallet.prototype.toV3 = function (password, opts) {
+Wallet.prototype.toV3 = function (password, opts, cb) {
   assert(this._privKey, 'This is a public key only wallet')
 
   opts = opts || {}
@@ -118,6 +103,8 @@ Wallet.prototype.toV3 = function (password, opts) {
     salt: salt.toString('hex')
   }
 
+  var self = this
+
   if (kdf === 'pbkdf2') {
     kdfparams.c = opts.c || 262144
     kdfparams.prf = 'hmac-sha256'
@@ -127,7 +114,45 @@ Wallet.prototype.toV3 = function (password, opts) {
     kdfparams.n = opts.n || 262144
     kdfparams.r = opts.r || 8
     kdfparams.p = opts.p || 1
-    derivedKey = scryptsy(new Buffer(password), salt, kdfparams.n, kdfparams.r, kdfparams.p, kdfparams.dklen)
+
+    scryptsy(new Buffer(password), salt, kdfparams.n, kdfparams.r, kdfparams.p, kdfparams.dklen, function (err, progress, derivedKey) {
+      if (err) {
+        return cb(err)
+      }
+
+      if (!derivedKey) {
+        return
+      }
+
+      var cipher = crypto.createCipheriv(opts.cipher || 'aes-128-ctr', Buffer.from(derivedKey.slice(0, 16)), iv)
+      if (!cipher) {
+        throw new Error('Unsupported cipher')
+      }
+
+      var ciphertext = Buffer.concat([ cipher.update(self.privKey), cipher.final() ])
+
+      var mac = ethUtil.sha3(Buffer.concat([ Buffer.from(derivedKey.slice(16, 32)), Buffer.from(ciphertext, 'hex') ]))
+
+      var resp = {
+        version: 3,
+        id: uuid.v4({ random: opts.uuid || crypto.randomBytes(16) }),
+        address: self.getAddress().toString('hex'),
+        crypto: {
+          ciphertext: ciphertext.toString('hex'),
+          cipherparams: {
+            iv: iv.toString('hex')
+          },
+          cipher: opts.cipher || 'aes-128-ctr',
+          kdf: kdf,
+          kdfparams: kdfparams,
+          mac: mac.toString('hex')
+        }
+      }
+
+      return cb(null, resp)
+    })
+
+    return
   } else {
     throw new Error('Unsupported kdf')
   }
@@ -141,7 +166,7 @@ Wallet.prototype.toV3 = function (password, opts) {
 
   var mac = ethUtil.sha3(Buffer.concat([ derivedKey.slice(16, 32), new Buffer(ciphertext, 'hex') ]))
 
-  return {
+  return cb(null, {
     version: 3,
     id: uuid.v4({ random: opts.uuid || crypto.randomBytes(16) }),
     address: this.getAddress().toString('hex'),
@@ -155,7 +180,7 @@ Wallet.prototype.toV3 = function (password, opts) {
       kdfparams: kdfparams,
       mac: mac.toString('hex')
     }
-  }
+  })
 }
 
 Wallet.prototype.getV3Filename = function (timestamp) {
@@ -180,8 +205,14 @@ Wallet.prototype.getV3Filename = function (timestamp) {
   ].join('')
 }
 
-Wallet.prototype.toV3String = function (password, opts) {
-  return JSON.stringify(this.toV3(password, opts))
+Wallet.prototype.toV3String = function (password, opts, cb) {
+  this.toV3(password, opts, function (err, v3) {
+    if (err) {
+      return cb(err)
+    }
+
+    cb(null, JSON.stringify(v3))
+  })
 }
 
 Wallet.fromPublicKey = function (pub, nonStrict) {
